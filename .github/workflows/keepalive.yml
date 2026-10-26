@@ -1,0 +1,122 @@
+name: Backend Keepalive
+
+# 每小时自动 ping 一次《时空跃动》后端，防止云托管平台因长期无访问而休眠/暂停。
+# 与本地 backend_pinger.py 打的是同一个只读健康检查接口，行为完全一致。
+
+on:
+  schedule:
+    # GitHub Actions 的 cron 使用 UTC 时间。
+    # 选 17 分而不是 0 分：错开整点高峰，排队延迟更小。
+    # 需要改成北京时间整点的话：UTC+8 -> cron 写 '0 */1 * * *' 对应北京 8/16/24 点…
+    #  hourly 就保持 '17 * * * *' 即可。
+    - cron: '17 * * * *'
+  workflow_dispatch: {}   # 允许在 Actions 页面手动触发，便于立即验证
+
+# 同一时刻只跑一个实例，避免手动触发和定时触发互相打架
+concurrency:
+  group: backend-keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 需要写权限来提交心跳日志
+
+env:
+  BACKEND_BASE_URL: https://backend.miaoda.online/projects/supabase372546469942571008
+  BACKEND_KEY: >-
+    eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoyMTA4MjQ5MjAwLCJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwic3ViIjoiYW5vbiJ9.M0IWARHJFKyor3GzXhYEcUL5KxJtQICtyKPirA7wrvI
+  BACKEND_TABLE: levels
+  BACKEND_QUERY: select=id&limit=1
+
+jobs:
+  ping:
+    name: Ping backend and record heartbeat
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 探活：最多 4 次尝试，指数退避，单次超时 20s ----
+      - name: Ping backend
+        id: ping
+        run: |
+          set -uo pipefail
+          URL="${BACKEND_BASE_URL%/}/rest/v1/${BACKEND_TABLE}?${BACKEND_QUERY}"
+          CODE="000"; LATENCY="0"; BODY=""
+
+          for attempt in 1 2 3 4; do
+            START=$(date +%s%N)
+            set +e
+            RESP=$(curl -sS --max-time 20 -w $'\n%{http_code}\n%{time_total}' \
+                     -H "apikey: ${BACKEND_KEY}" \
+                     -H "Authorization: Bearer ${BACKEND_KEY}" \
+                     -H "Accept: application/json" \
+                     "$URL" 2>/tmp/curl_err.txt)
+            RC=$?
+            set -e
+            END=$(date +%s%N)
+
+            LATENCY=$(awk -v s="$START" -v e="$END" 'BEGIN{printf "%.0f", (e-s)/1000000}')
+            if [ "$RC" -ne 0 ]; then
+              CODE="000"
+              BODY="curl rc=${RC}: $(head -c 200 /tmp/curl_err.txt | tr '\n' ' ')"
+            else
+              # 最后两行分别是 http_code 和 time_total
+              CODE=$(printf '%s' "$RESP" | tail -n 2 | head -n 1)
+              BODY=$(printf '%s' "$RESP" | head -n -2 | tr '\n' ' ' | head -c 200)
+            fi
+
+            echo "attempt=${attempt} http=${CODE} ${LATENCY}ms body=${BODY}"
+            if [ "$CODE" = "200" ]; then break; fi
+            sleep $(( attempt * 3 ))
+          done
+
+          if [ "$CODE" = "200" ]; then
+            echo "status=ok"      >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail"    >> "$GITHUB_OUTPUT"
+          fi
+          echo "http=${CODE}"      >> "$GITHUB_OUTPUT"
+          echo "latency=${LATENCY}" >> "$GITHUB_OUTPUT"
+          {
+            echo "BODY<<EOF_BODY"
+            echo "$BODY"
+            echo "EOF_BODY"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- 记录心跳日志 ----
+      - name: Append heartbeat log
+        run: |
+          TS=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          STATUS="${{ steps.ping.outputs.status }}"
+          HTTP="${{ steps.ping.outputs.http }}"
+          LAT="${{ steps.ping.outputs.latency }}"
+          LINE="${TS} | status=${STATUS} | http=${HTTP} | ${LAT}ms | run=${{ github.run_number }}"
+          printf '%s\n' "$LINE" >> heartbeat.log
+          tail -n 1 heartbeat.log
+          # 日志只保留最近 2000 行，避免仓库无限膨胀
+          tail -n 2000 heartbeat.log > heartbeat.log.tmp && mv heartbeat.log.tmp heartbeat.log
+
+      # ---- 提交并推送 ----
+      # 关键：GitHub 会在仓库 60 天无任何活动后自动停用 schedule 触发器。
+      # 只靠 workflow run 不算 activity，所以每次探活都真提交一次，
+      # 让仓库始终「有活动」，定时任务才能永久运行下去。
+      - name: Commit heartbeat
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.log
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "chore: keepalive $(date -u '+%Y-%m-%dT%H:%M:%SZ') [${{ steps.ping.outputs.status }}]"
+            git push
+          fi
+
+      # ---- 探活失败时让整个 job 变红，便于在 Actions 页面一眼看出异常 ----
+      - name: Fail if backend unreachable
+        if: steps.ping.outputs.status != 'ok'
+        run: |
+          echo "::error::后端探活失败（http=${{ steps.ping.outputs.http }}），请检查后端是否被平台暂停"
+          exit 1
